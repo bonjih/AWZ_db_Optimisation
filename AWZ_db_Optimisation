@@ -1,0 +1,249 @@
+__author__ = "ben hamilton - ICT320 Task 2 Assignment October 2017"
+#Interpreter Python 2.7
+
+# /* Australia Zoo Wildlife Hospital Accession Database (c) by
+# <AUTHOR(S)>
+# Australia Zoo Wildlife Hospital Accession Database is licensed
+# under a
+# Creative Commons Attribution 4.0 International License.
+# You should have received a copy of the license along with this
+# work. If not, see <http://creativecommons.org/licenses/by/4.0/>.
+# */
+
+import pandas as pd # use latest version
+import re
+import csv
+import mysql.connector
+
+def dbconnect():
+    """
+    Database connection for all queries
+    Replace connection details as required
+    """
+    cnx = mysql.connector.connect(
+    host='localhost', port=3306,
+    user='root', password='mysql',
+    database='ict320_bch010_task2')
+    cursor = cnx.cursor(buffered=True)
+    return cnx, cursor
+cnx, cursor = dbconnect()
+
+#######################################################
+# Retrieve relevant data for reporting
+query_Diag_aet__access_ids = cursor.execute(""" SELECT azwh_accessions.diagnosis_aetiological_ids
+                                                FROM azwh_accessions""")
+df1 = pd.DataFrame(cursor.fetchall())
+df1.to_csv('Diag_aet_access_ugly.csv', header = None, index = False)
+
+query_Diag_aet_access_id = cursor.execute(""" SELECT azwh_accessions.id
+                                             FROM azwh_accessions""")
+df2 = pd.DataFrame(cursor.fetchall()) # DF2 in memory
+
+query_Diag_aet_id = cursor.execute(""" SELECT azwh_diagnosis_aetiology.id
+                                        FROM azwh_diagnosis_aetiology""")
+df3 = pd.DataFrame(cursor.fetchall())
+
+#######################################################
+# Clean the data
+
+# Step 1 - Clean exported data
+df = pd.read_csv('Diag_aet_access_ugly.csv')
+df['Unnamed: 0'].replace(regex=True,inplace=True,to_replace=r'\D',value=r' ') #regex \D to remove any non-digit characters
+df = df['Unnamed: 0'].fillna('0') #remove NaN with ZERO to split
+data = lambda x: pd.Series([i for i in reversed(x.split(' '))]) # function to split on whitespaces
+df = df.apply(data) # apply the lambda function to 'data' - chrisalbon.com/python/pandas_apply_operations_to_dataframes.html
+df.drop([0], axis=1, inplace=True)
+
+#######################################################
+# require to add top row for script at the end. Required for diagnosis_aetiological_ids preservation in azwh db.
+newline = []
+newline.insert(0, {''})
+newline2 = pd.concat([pd.DataFrame(newline), df], ignore_index=True)
+newline2.drop([0], axis=1, inplace=True)
+df_newline2 = pd.concat([df2, newline2], axis=1)
+df_newline2.to_csv('Temp_Diag_aet_access_Temp.csv', index = False) # not required to print to csv, just to show result
+######################################################
+df.columns = df.iloc[1]
+df.to_csv('Temp_Diag_aet_access.csv', index = False) # Usable data - not required to print to csv, just to show result
+
+# Step 2 - Find and remove duplicate IDs
+SetA = set(df3[0]) #reads in memory contents of SELECT azwh_diagnosis_aetiology.id
+SetB = set(pd.read_csv("Temp_Diag_aet_access.csv",  header=None)[0]) #reads the csv, takes only the first column and creates a set. First column has the most ID's
+#reads the csv, takes all columns and creates a set out of it.
+redundent_Set = (SetB - SetA) # returns everything in 'B' that is not in set 'A' ('A' being azwh_diagnosis_aetiology.id) - docs.python.org/2/library/sets.html
+redundent_list = list(redundent_Set)
+# remove redundent_list from 'Temp_Diag_aet_access'
+a = list(pd.read_csv("Temp_Diag_aet_access.csv",  header = None)[0])
+b = [0 if x in redundent_list else x for x in a]
+# result imported back into azwh_accessions.diagnosis_aetiological_ids. Order preserved
+df = pd.DataFrame(b)
+df.loc[0] = [0]
+df.fillna(0, inplace=True)
+df = df.astype(int)
+df_merge = pd.concat([df2, df], axis=1) # merge diagnosis_aetiological_ids and azwh_accession.id for join (expensive on big data sets).
+df_merge.to_csv('Temp_import_cleaned.csv', index = False, header = None) # not required to print to csv, just to show set usage result
+
+# Step 3 - import cleaned data
+# Create temp table for cleaned data import
+query_drop_table = ("""DROP TABLE IF EXISTS temp_table_1""")
+cursor.execute (query_drop_table)
+cnx.commit()
+query_temp = ("""CREATE TABLE temp_table_1(id int(10), temp int (10))""")
+cursor.execute (query_temp)
+
+csv_data = csv.reader(file('Temp_import_cleaned.csv'))
+for row in csv_data:
+    cursor.execute('INSERT INTO temp_table_1(id,temp) VALUES(%s, %s)', row)
+
+# Prepare diagnosis_aetiological_ids for updated data from temp_table_1
+query_Diag_aet_Null = ("""UPDATE azwh_accessions SET diagnosis_aetiological_ids = NULL""")
+cursor.execute (query_Diag_aet_Null)
+
+# Make same data type as azwh_diagnosis_aetiology.id
+query_Diag_aet_Dtype = ("""ALTER TABLE azwh_accessions MODIFY diagnosis_aetiological_ids int(10)""")
+cursor.execute (query_Diag_aet_Dtype)
+
+# Join diagnosis_aetiological_ids and temp_table_1
+query_Diag_aet_Update = ("""UPDATE azwh_accessions AS t1
+                INNER JOIN temp_table_1 AS t2 on t1.id = t2.id
+                SET t1.diagnosis_aetiological_ids = t2.temp""")
+cursor.execute (query_Diag_aet_Update)
+cnx.commit()
+
+# #######################################################
+# Set FK and Unique constraints
+# turn off FK checks and turn on after FK added
+query_FKOff = """SET FOREIGN_KEY_CHECKS=0"""
+cursor.execute (query_FKOff)
+# Create FK constraint
+query_Set_FK1 = """ALTER TABLE azwh_accessions
+                ADD CONSTRAINT fk_aetiol_id FOREIGN KEY (diagnosis_aetiological_ids) REFERENCES azwh_diagnosis_aetiology(id)"""
+cursor.execute (query_Set_FK1)
+# Make same data type as azwh_juridiction.id
+query_Set_Dtype1 = """ALTER TABLE azwh_accessions modify rescue_jurisdiction_id int(10)"""
+cursor.execute (query_Set_Dtype1)
+# Create FK constraint
+query_Set_FK2 = """ALTER TABLE azwh_accessions
+        ADD CONSTRAINT fk_juris_id FOREIGN KEY (rescue_jurisdiction_id) REFERENCES azwh_jurisdictions(id)"""
+cursor.execute (query_Set_FK2)
+# Create Index on dates
+query_Set_IDX = """CREATE INDEX access_date_idx on azwh_accessions (date_admitted)"""
+cursor.execute (query_Set_IDX)
+# Create Unique Constraints
+query_uc_Patient = """ALTER TABLE azwh_accessions
+ADD CONSTRAINT uc_Patient UNIQUE (patient_id,animal_id)"""
+cursor.execute (query_uc_Patient)
+
+query_uc_AccNo = """ALTER TABLE azwh_accessions
+ADD CONSTRAINT uc_AccNo UNIQUE (accession_number)"""
+cursor.execute (query_uc_AccNo)
+
+# #######################################################
+# Report output
+
+def results():
+    """
+    Fetch queried data function for all queries
+    """
+    for period in cursor.stored_results():
+        totals = period.fetchall()
+        return totals
+
+##################################################################################
+# Monthly report - Diagnosis (Aetology)
+# SQL Procedure 1 - Get_Monthly_Diag_Aetiology
+
+# reporting month
+query_Diag = ('2016/3/1', '2016/3/31')
+
+# Call the stored procedure
+cursor.callproc('Get_Monthly_Diag_Aetiology', query_Diag)
+totals1 = results()
+
+##################################################################################
+# Monthly report - Monthly_Local_Govt_area
+# SQL Procedure 2 - Get_Monthly_Local_Govt_area
+
+query_Govt = ('2016/3/1', '2016/3/31')
+
+cursor.callproc('Get_Monthly_Local_Govt_area', query_Govt)
+totals2 = results()
+
+##################################################################################
+# Code for Monthly report - Month Yearly Comparisons
+# SQL Procedure 3 - Get_Month_Year_Comparisons
+
+# reporting year e.g. 2016 = total admissions for each month in 2016
+query_Comp = (2016,)
+
+cursor.callproc('Get_Month_Year_Comparisons', query_Comp)
+totals3 = results()
+
+##################################################################################
+# Monthly reports - one CSV for three reports
+with open('azwh_Monthly_Reports.csv', 'w') as csvfile:
+    writeCSV1 = csv.writer(csvfile, lineterminator='\n')
+    writeCSV1.writerow(['Diagnosis (Aetiology)            ']) # Report descriptor
+    for total in totals1:
+        writeCSV1.writerow(total)
+    writeCSV1.writerow([])
+    writeCSV2 = csv.writer(csvfile, lineterminator='\n')
+    writeCSV2.writerow(['Month Local Govt area'])
+    for total in totals2:
+        writeCSV2.writerow(total)
+    writeCSV2.writerow([])
+    writeCSV3 = csv.writer(csvfile, lineterminator='\n')
+    writeCSV3.writerow(['Monthly Yearly Comparisons'])
+    for total in totals3:
+        writeCSV3.writerow(total)
+    writeCSV3.writerow([])
+
+############################################################
+# adapted form stackoverflow.com/questions/11077801/import-csv-to-mysql-table
+# dynamically adds all diagnosis_aetiological_ids to temp_table_aetio for later use
+query_drop_table = ("""DROP TABLE IF EXISTS azwh_condition_aetio_other""")
+cursor.execute (query_drop_table)
+cnx.commit()
+
+col_header = '_id'
+csv_in = open('Temp_Diag_aet_access_Temp.csv', 'rb')
+csv_file = csv.DictReader(csv_in) # reads csv as a dictionary, headers are now use as keys
+query = 'CREATE TABLE azwh_condition_aetio_other ('
+query += ','.join('`{}` VARCHAR(255)'.format(column + col_header) for column in csv_file.fieldnames)
+query += ')' # query construction
+cursor.execute(query)
+
+for row in csv_file:
+    query = 'INSERT INTO azwh_condition_aetio_other SET '
+    query += ','.join('`{}` = %s'.format(column + col_header) for column in row.keys()) # Creates using variable %s
+    cursor.execute(query, row.values())
+
+query_Update_acc_num_1 = """ALTER TABLE azwh_accessions modify accession_number int(10)"""
+cursor.execute (query_Update_acc_num_1)
+
+query_Update_con_aetio_2 = ("""ALTER TABLE azwh_condition_aetio_other CHANGE COLUMN `0_id` id INT(10) NOT NULL,
+                            ADD CONSTRAINT PRIMARY KEY (id),
+							ADD COLUMN date_admitted DATE AFTER id,
+							DROP COLUMN `1_id`""")
+cursor.execute (query_Update_con_aetio_2)
+
+query_Update_con_aetio_3 = """UPDATE azwh_condition_aetio_other AS t1
+                            INNER JOIN azwh_accessions AS t2 on t1.id= t2.id
+                            SET t1.date_admitted = t2.date_admitted"""
+cursor.execute (query_Update_con_aetio_3)
+
+query_fk_con_aetio = ("""ALTER TABLE azwh_condition_aetio_other
+                            ADD CONSTRAINT fk_con_aetio_other FOREIGN KEY (id) REFERENCES azwh_accessions(accession_number)""")
+cursor.execute (query_fk_con_aetio)
+
+query_drop_table = ("""DROP TABLE IF EXISTS temp_table_1""")
+cursor.execute (query_drop_table)
+
+# turn on FK checks after FK add
+query_FKOn = """SET FOREIGN_KEY_CHECKS=1"""
+cursor.execute (query_FKOn)
+
+# Close connections
+cursor.close()
+cnx.commit()
+cnx.close()
